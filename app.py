@@ -5,8 +5,9 @@ import os
 import json
 import zipfile
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, Dict
 import csv
+from datetime import datetime, timedelta
 
 import uvicorn
 import torch
@@ -19,6 +20,11 @@ from sentence_transformers import SentenceTransformer
 from vllm import LLM, SamplingParams
 
 import logging
+system_prompt = """
+You are a knowledgeable software development assistant with deep expertise in code analysis and troubleshooting. You have access to a Git repository’s source code and documentation, which has been indexed and provided as "Code Context." Use the code context below to guide your answers, referencing file names and snippets when relevant.
+In addition, consider the recent conversation history that includes the user's previous queries and your responses. This history is provided solely as context to maintain conversation continuity.
+When answering, provide clear, concise, and accurate guidance, ensuring your explanation is grounded in the provided code context. If the provided context doesn’t fully address the query, suggest appropriate steps or clarifying questions. Moreover, if the provided context is not related to the user's query, feel free to disregard it and answer based on your general knowledge.
+"""
 
 # -------------------------------------------------------------------
 # 1. Logging Configuration
@@ -35,9 +41,9 @@ logger = logging.getLogger(__name__)
 app = FastAPI(
     title="RAG API Service",
     description=(
-        "A retrieval-augmented generation service with conversational memory. "
-        "The file index represents a GitHub repository (with preserved file paths), and chat history is maintained "
-        "to support continuous conversation."
+        "A retrieval-augmented generation service with short-term conversational memory. "
+        "The file index represents a GitHub repository, and chat history is persisted separately "
+        "for only the last hour."
     ),
     version="1.0.0"
 )
@@ -56,11 +62,16 @@ app.add_middleware(
 # -------------------------------------------------------------------
 UPLOAD_DIR = Path("uploads")
 INDEX_DIR = Path("faiss_indexes")
+THREADS_DIR = Path("threads")   # stores ephemeral conversation data
+
 UPLOAD_DIR.mkdir(exist_ok=True)
 INDEX_DIR.mkdir(exist_ok=True)
+THREADS_DIR.mkdir(exist_ok=True)
 
 DEFAULT_CHUNK_SIZE = 512
 DEFAULT_OVERLAP = 128
+ONE_HOUR = 3600  # seconds
+MAX_HISTORY_MESSAGES = 10  # max conversation turns to keep
 
 # Recognized text-based extensions (code, markdown, HTML, etc.)
 TEXT_BASED_EXTENSIONS = {
@@ -86,7 +97,8 @@ llm = LLM(
     device='cuda',
     dtype=torch.bfloat16,
     max_model_len=10000,
-    enforce_eager=True
+    enforce_eager=True,
+    gpu_memory_utilization=.8
 )
 llm_lock = threading.Lock()
 
@@ -103,13 +115,10 @@ embedding_lock = threading.Lock()
 class RequestBody(BaseModel):
     inputs: str
 
-class RagRequestBody(BaseModel):
-    query: str
-    index_id: Optional[str] = None
-
 class ChatRequestBody(BaseModel):
     query: str
-    index_id: str
+    index_id: Optional[str] = None
+    thread_id: Optional[str] = None
 
 class FileUploadResponse(BaseModel):
     index_id: str
@@ -131,8 +140,69 @@ class UploadStatusResponse(BaseModel):
     status: int  # -1 = indexing in progress, 0 = indexing complete
     message: str
 
+class ThreadCreateRequest(BaseModel):
+    index_id: str
+
+class ThreadResponse(BaseModel):
+    thread_id: str
+    created_at: float
+
+class ChatResponse(BaseModel):
+    response: str
+    thread_id: Optional[str] = None
+    sources: List[str] = []
+    stats: Dict[str, float]
 # -------------------------------------------------------------------
-# 7. CSV Utility Functions
+# 7. Thread Management
+# -------------------------------------------------------------------
+def get_thread_path(index_id: str, thread_id: str) -> Path:
+    """Get path for thread JSON file"""
+    return THREADS_DIR / index_id / f"{thread_id}.json"
+
+def create_thread(index_id: str) -> str:
+    """Create new thread and return thread ID"""
+    thread_id = str(uuid.uuid4())
+    thread_path = get_thread_path(index_id, thread_id)
+    thread_path.parent.mkdir(parents=True, exist_ok=True)
+    thread_path.touch()
+    return thread_id
+
+def load_thread_history(index_id: str, thread_id: str) -> List[Dict]:
+    """Load and prune thread history"""
+    thread_path = get_thread_path(index_id, thread_id)
+    if not thread_path.exists():
+        return []
+
+    try:
+        with open(thread_path, "r") as f:
+            history = json.load(f)
+    except:
+        return []
+
+    # Prune by time (1 hour)
+    cutoff = time.time() - ONE_HOUR
+    history = [msg for msg in history if msg['timestamp'] > cutoff]
+
+    # Prune by message count (last 5 turns)
+    history = history[-MAX_HISTORY_MESSAGES*2:]
+
+    return history
+
+def save_thread_message(index_id: str, thread_id: str, query: str, response: str):
+    """Save new messages to thread history"""
+    thread_path = get_thread_path(index_id, thread_id)
+    history = load_thread_history(index_id, thread_id)
+    
+    history.append({
+        "query": query,
+        "response": response,
+        "timestamp": time.time()
+    })
+    
+    with open(thread_path, "w") as f:
+        json.dump(history, f)
+# -------------------------------------------------------------------
+# 8. CSV Utility Functions
 # -------------------------------------------------------------------
 def ensure_csv_exists():
     """Create the users.csv if not already present, with a header row."""
@@ -188,7 +258,6 @@ def get_status_by_index_id(index_id: str) -> int:
     for row in data:
         if row["index_id"] == index_id:
             return int(row["status"])
-    # If not found, default to 0 or raise error
     raise HTTPException(status_code=404, detail=f"Index {index_id} not found in CSV.")
 
 def set_status_by_index_id(index_id: str, status: int):
@@ -206,7 +275,7 @@ def set_status_by_index_id(index_id: str, status: int):
         raise HTTPException(status_code=404, detail=f"Index {index_id} not found in CSV.")
 
 # -------------------------------------------------------------------
-# 8. Embedding & Index Utility
+# 9. Embedding & Index Utility
 # -------------------------------------------------------------------
 def embed_batch(texts: List[str]) -> np.ndarray:
     """Embed a list of texts using the shared embedding model."""
@@ -225,10 +294,7 @@ def chunk_text(text: str, chunk_size: int = DEFAULT_CHUNK_SIZE, overlap: int = D
 def unzip_and_collect_documents(zip_path: Path) -> List[dict]:
     """
     Extract a ZIP file from a saved path while preserving folder structure.
-    Returns a list of document chunks with metadata:
-      - "text": the chunk content
-      - "source_file": the relative file path
-      - "chunk_size": number of words in the chunk
+    Returns a list of document chunks with metadata.
     """
     temp_folder = Path(zip_path).parent  # the folder containing "uploaded.zip"
     with zipfile.ZipFile(zip_path, "r") as zip_ref:
@@ -261,9 +327,7 @@ def unzip_and_collect_documents(zip_path: Path) -> List[dict]:
     return documents
 
 def create_faiss_index(documents: List[dict]) -> Tuple[np.ndarray, faiss.IndexFlatL2]:
-    """
-    Create a FAISS index from document chunks.
-    """
+    """Create a FAISS index from document chunks."""
     texts = [doc["text"] for doc in documents]
     embeddings = embed_batch(texts)
     index = faiss.IndexFlatL2(embeddings.shape[1])
@@ -271,9 +335,7 @@ def create_faiss_index(documents: List[dict]) -> Tuple[np.ndarray, faiss.IndexFl
     return embeddings, index
 
 def save_index_and_metadata(index_id: str, index: faiss.IndexFlatL2, documents: List[dict], embeddings: np.ndarray):
-    """
-    Save the FAISS index, embeddings, and document metadata.
-    """
+    """Save the FAISS index, embeddings, and document metadata."""
     index_path = INDEX_DIR / index_id
     index_path.mkdir(exist_ok=True)
     faiss.write_index(index, str(index_path / "index.faiss"))
@@ -282,9 +344,7 @@ def save_index_and_metadata(index_id: str, index: faiss.IndexFlatL2, documents: 
         json.dump(documents, f, ensure_ascii=False)
 
 def load_index_and_metadata(index_id: str) -> Tuple[faiss.IndexFlatL2, List[dict], np.ndarray]:
-    """
-    Load the FAISS index, embeddings, and document metadata.
-    """
+    """Load the FAISS index, embeddings, and document metadata."""
     index_path = INDEX_DIR / index_id
     if not index_path.exists():
         raise HTTPException(status_code=404, detail=f"Index '{index_id}' not found.")
@@ -300,7 +360,7 @@ def load_index_and_metadata(index_id: str) -> Tuple[faiss.IndexFlatL2, List[dict
     return index, documents, embeddings
 
 # -------------------------------------------------------------------
-# 9. Index Lock Management
+# 10. Index Lock Management
 # -------------------------------------------------------------------
 index_locks = {}
 global_lock = threading.Lock()
@@ -313,13 +373,13 @@ def get_index_lock(index_id: str) -> threading.Lock:
         return index_locks[index_id]
 
 # -------------------------------------------------------------------
-# 10. Initiate Chat
+# 11. Initiate Chat
 # -------------------------------------------------------------------
 @app.post("/initiate_chat/", response_model=InitiateChatResponse)
 def initiate_chat(request: InitiateChatRequest):
     """
-    Basic "login" or session start. 
-    - If user_id exists, returns existing index_id. 
+    Basic "login" or session start.
+    - If user_id exists, returns existing index_id.
     - Otherwise, creates a new index_id for that user.
     """
     user_id = request.user_id
@@ -344,7 +404,7 @@ def initiate_chat(request: InitiateChatRequest):
         )
 
 # -------------------------------------------------------------------
-# 11. Background Task for Indexing
+# 12. Background Task for Indexing
 # -------------------------------------------------------------------
 def do_indexing(index_id: str, zip_file_path: Path):
     """
@@ -369,7 +429,7 @@ def do_indexing(index_id: str, zip_file_path: Path):
         set_status_by_index_id(index_id, 0)  # Reset to 0 on failure
 
 # -------------------------------------------------------------------
-# 12. Async Endpoint: Upload File (Background Task)
+# 13. Async Endpoint: Upload File (Background Task)
 # -------------------------------------------------------------------
 @app.post("/upload_file_async/", response_model=UploadStatusResponse)
 def upload_file_async(
@@ -392,9 +452,8 @@ def upload_file_async(
         return UploadStatusResponse(status=current_status, message=msg)
 
     # If file => start background indexing
-    # 1) Set status = -1
-    set_status_by_index_id(index_id, -1)
-    
+    set_status_by_index_id(index_id, -1)  # Mark status = -1 (indexing in progress)
+
     # 2) Save the uploaded file to a temp folder
     temp_folder = UPLOAD_DIR / str(uuid.uuid4())
     temp_folder.mkdir(parents=True, exist_ok=True)
@@ -413,178 +472,153 @@ def upload_file_async(
     )
 
 # -------------------------------------------------------------------
-# 13. Remainder of Endpoints (Predict, RAG, Chat, Clear Chat)
+# 14. Conversation (Ephemeral) Storage
 # -------------------------------------------------------------------
-@app.post("/predict/")
-async def predict(body: RequestBody):
+def load_conversation(index_id: str) -> List[dict]:
     """
-    Direct inference endpoint without retrieval.
+    Load the existing conversation from threads/{index_id}.json.
+    Returns a list of messages, each with { "role": "user"|"assistant", "content": "...", "timestamp": <float> }.
     """
-    try:
-        start = time.time()
-        messages = [{"role": "user", "content": body.inputs.strip()}]
-        with llm_lock:
-            outputs = llm.chat(messages, SamplingParams(temperature=0.6, top_p=0.9, max_tokens=5000))
-        return {
-            "response": outputs[0].outputs[0].text,
-            "stats": {
-                "time": round(time.time() - start, 2),
-                "in_tokens": len(outputs[0].prompt_token_ids),
-                "out_tokens": len(outputs[0].outputs[0].token_ids)
-            }
-        }
-    except Exception as e:
-        logger.error(f"Prediction error: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=str(e))
+    conv_file = THREADS_DIR / f"{index_id}.json"
+    if not conv_file.exists():
+        return []
+    with open(conv_file, "r", encoding="utf-8") as f:
+        try:
+            return json.load(f)
+        except:
+            return []
 
-@app.post("/predict_rag/")
-async def predict_rag(body: RagRequestBody):
+def save_conversation(index_id: str, messages: List[dict]):
     """
-    RAG endpoint using the file index.
+    Save the conversation to threads/{index_id}.json, overwriting old data.
     """
-    try:
-        if not body.index_id:
-            raise HTTPException(status_code=400, detail="index_id required.")
-        index, documents, _ = load_index_and_metadata(body.index_id)
-        query_embed = embed_batch([body.query])[0].reshape(1, -1)
-        _, indices = index.search(query_embed, 5)
-        context = "\n".join(
-            [f"File: {documents[i]['source_file']}\n{documents[i]['text']}" for i in indices[0]]
-        )
-        messages = [
-            {
-                "role": "system",
-                "content": (
-                    "You are a codebase expert. The following context is derived from a file index representing a GitHub repository. "
-                    "Each excerpt shows its original file path. Use this context to answer the question and reference sources appropriately."
-                )
-            },
-            {
-                "role": "user",
-                "content": f"Context:\n{context}\n\nQuestion: {body.query}"
-            }
-        ]
-        start = time.time()
-        with llm_lock:
-            outputs = llm.chat(messages, SamplingParams(temperature=0.7, top_p=0.9, max_tokens=5000))
-        return {
-            "response": outputs[0].outputs[0].text.strip(),
-            "sources": [documents[i]['source_file'] for i in indices[0]],
-            "stats": {
-                "time": round(time.time() - start, 2),
-                "in_tokens": len(outputs[0].prompt_token_ids),
-                "out_tokens": len(outputs[0].outputs[0].token_ids)
-            }
-        }
-    except Exception as e:
-        logger.error(f"RAG error: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=str(e))
+    conv_file = THREADS_DIR / f"{index_id}.json"
+    conv_file.parent.mkdir(parents=True, exist_ok=True)
+    with open(conv_file, "w", encoding="utf-8") as f:
+        json.dump(messages, f, ensure_ascii=False, indent=2)
 
-@app.post("/chat/")
+def prune_old_messages(messages: List[dict], max_age=ONE_HOUR) -> List[dict]:
+    """
+    Keep only messages within the last `max_age` seconds.
+    """
+    now = time.time()
+    return [m for m in messages if (now - m["timestamp"]) <= max_age]
+
+
+# -------------------------------------------------------------------
+# 15. Create thread for conversation history
+# -------------------------------------------------------------------
+@app.post("/create_thread", response_model=ThreadResponse)
+def create_thread_endpoint(request: ThreadCreateRequest):
+    """Create new conversation thread for an index"""
+    if not request.index_id:
+        raise HTTPException(400, "index_id is required")
+    
+    thread_id = create_thread(request.index_id)
+    return ThreadResponse(
+        thread_id=thread_id,
+        created_at=time.time()
+    )
+# -------------------------------------------------------------------
+# 16. Chat Endpoint (with ephemeral conversation & RAG)
+# -------------------------------------------------------------------
+@app.post("/chat/", response_model=ChatResponse)
 async def chat_with_history(body: ChatRequestBody):
-    """
-    Chat endpoint with conversational memory. 
-    Uses the same FAISS index with appended user/assistant messages.
-    """
     try:
-        lock = get_index_lock(body.index_id)
-        with lock:
-            index, documents, embeddings = load_index_and_metadata(body.index_id)
-            
-            # Retrieve top 5 chunks for overall context
-            query_embed = embed_batch([body.query])[0].reshape(1, -1)
-            _, idxs = index.search(query_embed, 5)
-            
-            # Separate retrieved documents into code context and chat history
-            code_context_list = []
-            convo_context_list = []
-            for i in idxs[0]:
-                doc = documents[i]
-                if "type" in doc:
-                    convo_context_list.append(f"{doc['source_file']}:\n{doc['text']}")
-                else:
-                    code_context_list.append(f"{doc['source_file']}:\n{doc['text']}")
-            code_context = "\n".join(code_context_list)
-            previous_convo_context = "\n".join(convo_context_list[:2])  # top 2 chat chunks
-            
-            # Build system prompt
+        response_text = ""
+        sources = []
+        start_time = time.time()
+        
+        # Mode 1: No index mode (normal chat)
+        if not body.index_id:
             messages = [
-                {
-                    "role": "system",
-                    "content": (
-                        "You are a helpful assistant. Use the following context to answer the current query:\n"
-                        "code context::::\n" + code_context + "\n"
-                        "previous_convo_context :::\n" + previous_convo_context + "\n"
-                        "Answer the question clearly while maintaining conversation continuity."
-                    )
-                },
-                {
-                    "role": "user",
-                    "content": f"Current Question: {body.query}"
-                }
+                {"role": "system", "content": system_prompt + "\n\nProvide a well-structured response to the following query."},
+                {"role": "user", "content": body.query}
             ]
-            start = time.time()
             with llm_lock:
-                outputs = llm.chat(messages, SamplingParams(temperature=0.7, top_p=0.9, max_tokens=5000))
-            response = outputs[0].outputs[0].text.strip()
-            
-            # Append user + assistant messages to the index
-            timestamp = int(time.time())
-            new_docs = [
-                {
-                    "text": body.query,
-                    "source_file": f"chat/{timestamp}_user",
-                    "chunk_size": len(body.query.split()),
-                    "type": "user_input"
-                },
-                {
-                    "text": response,
-                    "source_file": f"chat/{timestamp}_assistant",
-                    "chunk_size": len(response.split()),
-                    "type": "assistant_response"
-                }
+                outputs = llm.chat(messages, SamplingParams(temperature=0.7, max_tokens=1000))
+            response_text = outputs[0].outputs[0].text.strip()
+            return ChatResponse(
+                response=response_text,
+                stats={"time": round(time.time()-start_time, 2)}
+            )
+
+        # Mode 2/3: Index-based chat
+        index, documents, _ = load_index_and_metadata(body.index_id)
+        
+        # Retrieve RAG context
+        query_embed = embed_batch([body.query])[0].reshape(1, -1)
+        _, idxs = index.search(query_embed, 5)
+        sources = [documents[i]['source_file'] for i in idxs[0]]
+        code_context = "\n".join(
+            [f"File: {documents[i]['source_file']}\n{documents[i]['text']}" 
+             for i in idxs[0]]
+        )
+
+        # Mode 2: Index without thread
+        if not body.thread_id:
+            usr_msg = f"""You have access to the following relevant code context:\n\n{code_context}\n\nUse this context to generate a clear and accurate response to the user's query."""
+            messages = [
+                {"role": "system", "content": system_prompt + '\n\n' + usr_msg},
+                {"role": "user", "content": body.query}
             ]
-            new_embeddings = embed_batch([body.query, response])
-            index.add(new_embeddings)
-            updated_docs = documents + new_docs
-            updated_embeds = np.vstack([embeddings, new_embeddings])
-            save_index_and_metadata(body.index_id, index, updated_docs, updated_embeds)
-            
-            return {
-                "response": response,
-                "context_sources": [documents[i]['source_file'] for i in idxs[0]],
-                "stats": {
-                    "time": round(time.time() - start, 2),
-                    "in_tokens": len(outputs[0].prompt_token_ids),
-                    "out_tokens": len(outputs[0].outputs[0].token_ids)
-                }
-            }
+        # Mode 3: Index with thread
+        else:
+            # Load and prepare conversation history
+            history = load_thread_history(body.index_id, body.thread_id)
+            conversation = []
+            for msg in history:
+                conversation.append(f"User: {msg['query']}")
+                
+                # Truncate response to three sentences
+                response_sentences = msg['response'].split(". ")
+                truncated_response = ". ".join(response_sentences[:3])  # Take first three sentences
+
+                # Append "..." if there are more sentences
+                if len(response_sentences) > 3:
+                    truncated_response += " ..."
+
+                conversation.append(f"Assistant: {truncated_response}")
+            conversation_history = '\n'.join(conversation[-MAX_HISTORY_MESSAGES*2:])
+            user_msg = (
+                "You have access to the following relevant code context:\n\n"
+                f"{code_context}\n\n"
+                "Additionally, here is the recent conversation history to maintain continuity:\n\n"
+                f"{conversation_history}\n\n"
+                "Use both the provided code context and past conversation to generate a precise and well-structured response to the user's query."
+            )
+            messages = [
+                {"role": "system", "content": system_prompt + '\n\n' + user_msg},
+                {"role": "user", "content": body.query}
+            ]
+
+        # Generate response
+        with llm_lock:
+            outputs = llm.chat(messages, SamplingParams(temperature=0.7, max_tokens=1000))
+        response_text = outputs[0].outputs[0].text.strip()
+
+        # Save to thread if applicable
+        if body.thread_id:
+            save_thread_message(
+                body.index_id,
+                body.thread_id,
+                body.query,
+                response_text
+            )
+
+        return ChatResponse(
+            response=response_text,
+            thread_id=body.thread_id,
+            sources=sources,
+            stats={"time": round(time.time()-start_time, 2)}
+        )
+
     except Exception as e:
         logger.error(f"Chat error: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.post("/clear_chat/")
-async def clear_chat(request: ClearChatRequest):
-    """
-    Clear the chat history for a given index by removing documents with a "type" field,
-    then rebuild the FAISS index using only the original code-based documents.
-    """
-    try:
-        lock = get_index_lock(request.index_id)
-        with lock:
-            index, documents, _ = load_index_and_metadata(request.index_id)
-            # Filter out chat history documents (those with a "type" field)
-            filtered_docs = [doc for doc in documents if "type" not in doc]
-            new_embeddings, new_index = create_faiss_index(filtered_docs)
-            save_index_and_metadata(request.index_id, new_index, filtered_docs, new_embeddings)
-        return {"message": "Chat history cleared."}
-    except Exception as e:
-        logger.error(f"Clear chat error: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=str(e))
-
+        raise HTTPException(500, str(e))
 # -------------------------------------------------------------------
-# 14. Main Entry
+# 16. Main Entry
 # -------------------------------------------------------------------
 if __name__ == "__main__":
-    # Note: use --workers to allow concurrency, e.g. `uvicorn main:app --workers 4`
+    # use --workers for concurrency: e.g. uvicorn main:app --workers 4
     uvicorn.run(app, host="0.0.0.0", port=8000)
