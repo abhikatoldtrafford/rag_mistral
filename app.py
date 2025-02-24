@@ -8,7 +8,9 @@ from pathlib import Path
 from typing import List, Optional, Tuple, Dict
 import csv
 from datetime import datetime, timedelta
-
+import re
+from nltk.tokenize import sent_tokenize
+from functools import lru_cache
 import uvicorn
 import torch
 import faiss
@@ -19,13 +21,60 @@ from pydantic import BaseModel
 from sentence_transformers import SentenceTransformer
 from vllm import LLM, SamplingParams
 
-import logging
-system_prompt = """
-You are a knowledgeable software development assistant with deep expertise in code analysis and troubleshooting. You have access to a Git repository’s source code and documentation, which has been indexed and provided as "Code Context." Use the code context below to guide your answers, referencing file names and snippets when relevant.
-In addition, consider the recent conversation history that includes the user's previous queries and your responses. This history is provided solely as context to maintain conversation continuity.
-When answering, provide clear, concise, and accurate guidance, ensuring your explanation is grounded in the provided code context. If the provided context doesn’t fully address the query, suggest appropriate steps or clarifying questions. Moreover, if the provided context is not related to the user's query, feel free to disregard it and answer based on your general knowledge.
-"""
+import logging, nltk
+try:
+    nltk.data.find('tokenizers/punkt')
+except LookupError:
+    nltk.download('punkt')
+system_prompt = '''
+You are a specialized software development assistant with deep expertise in code analysis, troubleshooting, and test generation. Your primary focus should ALWAYS be addressing the user's immediate query with precision.
 
+Priority Order for Information Sources:
+1. User Query (HIGHEST PRIORITY)
+   - Always address the specific question or task requested
+   - If query is unclear, ask for clarification before proceeding
+   - Never ignore any part of the user's query
+
+2. Code Context (SECONDARY PRIORITY)
+   - Provided in the format:
+     File: <filename>
+     <code or text content>
+   - Reference this context if it's relevant to the query
+   - Always cite specific files when using this context
+   - If the context seems irrelevant with respect to user query, rely on general knowledge instead
+
+3. Conversation History (TERTIARY PRIORITY)
+   - Provided in the format:
+     User: <previous question>
+     Assistant: <previous response>
+   - Use only to maintain consistency with previous interactions
+   - Don't let historical context override the current query's needs
+
+4. General Knowledge (FALLBACK)
+   - Use when other sources don't provide relevant information
+   - Clearly state when you're using general knowledge instead of provided context
+
+Response Guidelines:
+- Start responses by directly addressing the user's query
+- Keep context references focused and relevant
+- Format code sections with proper markdown
+- When analyzing code:
+  * Point out specific files and line references
+  * Highlight potential issues
+  * Suggest specific improvements
+- For test scenarios:
+  * Cover edge cases
+  * Provide concrete examples
+  * Structure tests logically
+
+Remember: You will receive context in this specific structure:
+1. PRIMARY: The user's query will be provided directly
+2. CONTEXT: If available, code context will be clearly marked with "File:" headers
+3. HISTORY: If available, conversation history will be formatted as User/Assistant pairs
+4. SYSTEM: Your general knowledge serves as a fallback
+
+Always validate that any context or history you reference is actually relevant to the current query before including it in your response.
+'''
 # -------------------------------------------------------------------
 # 1. Logging Configuration
 # -------------------------------------------------------------------
@@ -152,6 +201,58 @@ class ChatResponse(BaseModel):
     thread_id: Optional[str] = None
     sources: List[str] = []
     stats: Dict[str, float]
+
+
+
+@lru_cache(maxsize=1000)
+def cached_sent_tokenize(text: str) -> list:
+    return sent_tokenize(text)
+
+def is_list_item(text: str) -> bool:
+    return text.strip().startswith(('- ', '* ', '• ', '1. ', '2. '))
+
+def summarize_response(text: str, max_sentences: int = 3) -> str:
+    """
+    Summarizes a response by preserving code blocks, handling lists, and truncating to N sentences.
+    """
+    if not text or len(text.strip()) < 100:
+        return text.strip()
+
+    # Save code blocks
+    code_blocks = []
+    def save_code(match):
+        code_blocks.append(match.group(0))
+        return f"[CODE_BLOCK_{len(code_blocks)-1}]"
+
+    cleaned = text.strip()
+    cleaned = re.sub(r'(```[\s\S]*?```|`[^`]*`|^\s{4,}.*$)', save_code, cleaned, flags=re.MULTILINE)
+
+    # Split into sentences
+    sentences = cached_sent_tokenize(cleaned)
+    summary = []
+    list_in_progress = False
+
+    for sentence in sentences:
+        if is_list_item(sentence):
+            list_in_progress = True
+        elif list_in_progress and not sentence.strip():
+            list_in_progress = False
+
+        summary.append(sentence)
+        if len(summary) >= max_sentences and not list_in_progress:
+            break
+
+    result = ' '.join(summary)
+
+    # Restore code blocks
+    for i, block in enumerate(code_blocks):
+        result = result.replace(f"[CODE_BLOCK_{i}]", block)
+
+    # Add ellipsis if truncated
+    if len(sentences) > max_sentences:
+        result += '...'
+
+    return result.strip()
 # -------------------------------------------------------------------
 # 7. Thread Management
 # -------------------------------------------------------------------
@@ -330,7 +431,9 @@ def create_faiss_index(documents: List[dict]) -> Tuple[np.ndarray, faiss.IndexFl
     """Create a FAISS index from document chunks."""
     texts = [doc["text"] for doc in documents]
     embeddings = embed_batch(texts)
-    index = faiss.IndexFlatL2(embeddings.shape[1])
+    # index = faiss.IndexFlatL2(embeddings.shape[1])
+    faiss.normalize_L2(embeddings)
+    index = faiss.IndexFlatIP(embeddings.shape[1])
     index.add(embeddings)
     return embeddings, index
 
@@ -545,9 +648,9 @@ async def chat_with_history(body: ChatRequestBody):
 
         # Mode 2/3: Index-based chat
         index, documents, _ = load_index_and_metadata(body.index_id)
-        
         # Retrieve RAG context
         query_embed = embed_batch([body.query])[0].reshape(1, -1)
+        faiss.normalize_L2(query_embed)
         _, idxs = index.search(query_embed, 5)
         sources = [documents[i]['source_file'] for i in idxs[0]]
         code_context = "\n".join(
@@ -571,13 +674,9 @@ async def chat_with_history(body: ChatRequestBody):
                 conversation.append(f"User: {msg['query']}")
                 
                 # Truncate response to three sentences
-                response_sentences = msg['response'].split(". ")
-                truncated_response = ". ".join(response_sentences[:3])  # Take first three sentences
-
-                # Append "..." if there are more sentences
-                if len(response_sentences) > 3:
-                    truncated_response += " ..."
-
+                # response_sentences = msg['response'].split(". ")
+                # truncated_response = ". ".join(response_sentences[:3])  # Take first three sentences
+                truncated_response = summarize_response(msg['response'])
                 conversation.append(f"Assistant: {truncated_response}")
             conversation_history = '\n'.join(conversation[-MAX_HISTORY_MESSAGES*2:])
             user_msg = (
